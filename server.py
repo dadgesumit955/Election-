@@ -3,6 +3,8 @@ import os
 import secrets
 import sqlite3
 import threading
+import urllib.request
+import urllib.error
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, unquote
@@ -10,77 +12,162 @@ from urllib.parse import urlparse, unquote
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "election.db")
 PORT = int(os.environ.get("PORT", "8000"))
-HOST = os.environ.get("HOST", "127.0.0.1")
-if os.environ.get("RENDER"):
-    HOST = "0.0.0.0"
+HOST = os.environ.get("HOST", "0.0.0.0")
 
 COLLEGE_NAME = "College of Engineering"
 DEPARTMENTS = ["AI & ML", "Computer Engineering", "Civil Engineering", "Electronics & Telecommunication"]
 ADMIN_USERS = {"admin": "admin123"}
 STATUSES = {"draft", "open", "paused", "closed", "published"}
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS students (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  department TEXT NOT NULL,
-  year TEXT DEFAULT 'SE',
-  pin TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS elections (
-  id TEXT PRIMARY KEY,
-  title TEXT NOT NULL,
-  type TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'draft',
-  created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS election_departments (
-  election_id TEXT NOT NULL REFERENCES elections(id) ON DELETE CASCADE,
-  department TEXT NOT NULL,
-  PRIMARY KEY (election_id, department)
-);
-CREATE TABLE IF NOT EXISTS positions (
-  id TEXT PRIMARY KEY,
-  election_id TEXT NOT NULL REFERENCES elections(id) ON DELETE CASCADE,
-  title TEXT NOT NULL,
-  description TEXT
-);
-CREATE TABLE IF NOT EXISTS candidates (
-  id TEXT PRIMARY KEY,
-  position_id TEXT NOT NULL REFERENCES positions(id) ON DELETE CASCADE,
-  name TEXT NOT NULL,
-  department TEXT,
-  year TEXT,
-  platform TEXT,
-  symbol TEXT,
-  photo TEXT
-);
-CREATE TABLE IF NOT EXISTS voter_status (
-  election_id TEXT NOT NULL,
-  student_id TEXT NOT NULL,
-  receipt_no TEXT NOT NULL,
-  voted_at TEXT NOT NULL,
-  PRIMARY KEY (election_id, student_id)
-);
-CREATE TABLE IF NOT EXISTS ballots (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ballot_id TEXT NOT NULL,
-  election_id TEXT NOT NULL,
-  position_id TEXT NOT NULL,
-  candidate_id TEXT NOT NULL,
-  voted_at TEXT NOT NULL,
-  UNIQUE (ballot_id, election_id, position_id)
-);
-CREATE TABLE IF NOT EXISTS audit_log (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  at TEXT NOT NULL,
-  action TEXT NOT NULL
-);
-"""
+SCHEMA_STATEMENTS = [
+    "CREATE TABLE IF NOT EXISTS students (id TEXT PRIMARY KEY, name TEXT NOT NULL, department TEXT NOT NULL, year TEXT DEFAULT 'SE', pin TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS elections (id TEXT PRIMARY KEY, title TEXT NOT NULL, type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft', created_at TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS election_departments (election_id TEXT NOT NULL REFERENCES elections(id) ON DELETE CASCADE, department TEXT NOT NULL, PRIMARY KEY (election_id, department))",
+    "CREATE TABLE IF NOT EXISTS positions (id TEXT PRIMARY KEY, election_id TEXT NOT NULL REFERENCES elections(id) ON DELETE CASCADE, title TEXT NOT NULL, description TEXT)",
+    "CREATE TABLE IF NOT EXISTS candidates (id TEXT PRIMARY KEY, position_id TEXT NOT NULL REFERENCES positions(id) ON DELETE CASCADE, name TEXT NOT NULL, department TEXT, year TEXT, platform TEXT, symbol TEXT, photo TEXT)",
+    "CREATE TABLE IF NOT EXISTS voter_status (election_id TEXT NOT NULL, student_id TEXT NOT NULL, receipt_no TEXT NOT NULL, voted_at TEXT NOT NULL, PRIMARY KEY (election_id, student_id))",
+    "CREATE TABLE IF NOT EXISTS ballots (id INTEGER PRIMARY KEY AUTOINCREMENT, ballot_id TEXT NOT NULL, election_id TEXT NOT NULL, position_id TEXT NOT NULL, candidate_id TEXT NOT NULL, voted_at TEXT NOT NULL, UNIQUE (ballot_id, election_id, position_id))",
+    "CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, action TEXT NOT NULL)",
+]
 
 tokens = {}
 uploads = {}
 write_lock = threading.Lock()
+
+
+def read_config_file(name):
+    p = os.path.join(BASE_DIR, name)
+    if os.path.isfile(p):
+        with open(p, "r", encoding="utf-8") as f:
+            v = f.read().strip()
+        return v or None
+    return None
+
+
+TURSO_URL = os.environ.get("TURSO_URL") or os.environ.get("TURSO_DATABASE_URL") or read_config_file("turso_url.txt")
+TURSO_TOKEN = os.environ.get("TURSO_TOKEN") or os.environ.get("TURSO_AUTH_TOKEN") or read_config_file("turso_token.txt")
+TURSO_ENABLED = bool(TURSO_URL and TURSO_TOKEN)
+
+
+class TursoHTTPError(Exception):
+    pass
+
+
+class RowConflictError(Exception):
+    pass
+
+
+class TursoDB:
+    def __init__(self, raw_url, token):
+        if raw_url.startswith("libsql://"):
+            raw_url = "https://" + raw_url[len("libsql://"):]
+        elif raw_url.startswith("http://"):
+            raw_url = "https://" + raw_url[len("http://"):]
+        self.base = raw_url.rstrip("/")
+        self.token = token
+        self.endpoint = self.base + "/"
+
+    def _request(self, statements):
+        body = json.dumps({"statements": statements}).encode("utf-8")
+        req = urllib.request.Request(
+            self.endpoint,
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/json", "Authorization": "Bearer " + self.token},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            raise TursoHTTPError("HTTP %d: %s" % (e.code, e.read().decode("utf-8", "replace")[:300]))
+        except OSError as e:
+            raise TursoHTTPError(str(e))
+        results = payload if isinstance(payload, list) else [payload]
+        out = []
+        for entry in results:
+            if not isinstance(entry, dict):
+                raise TursoHTTPError(str(entry))
+            if "error" in entry:
+                err = entry["error"]
+                if isinstance(err, dict):
+                    message = err.get("message", "")
+                    code = err.get("code")
+                else:
+                    message = str(err)
+                    code = None
+                up = (message or "").upper()
+                if code in ("2067", "1555") or "UNIQUE" in up or "must be unique" in up:
+                    raise RowConflictError(message)
+                raise TursoHTTPError(message or str(err))
+            out.append(entry.get("results") or entry)
+        return out
+
+    def statement(self, sql, args=()):
+        s = sql.strip().upper()
+        if s.startswith(("BEGIN", "COMMIT", "ROLLBACK", "PRAGMA")):
+            return {"cols": [], "rows": [], "rows_affected": 0}
+        res = self._request([{"q": sql, "params": list(args or ())}])[0]
+        return {
+            "cols": res.get("columns") or res.get("cols") or [],
+            "rows": res.get("rows") or [],
+            "rows_affected": res.get("rows_affected", 0),
+        }
+
+    def statements(self, sql_args_list):
+        stmts = [{"q": sql, "params": list(args or ())} for sql, args in sql_args_list]
+        ress = self._request(stmts)
+        return [{**r, "cols": r.get("columns") or r.get("cols") or []} for r in ress]
+
+
+class TursoResult:
+    def __init__(self, stmt):
+        cols = stmt.get("cols") or []
+        self._rows = [dict(zip(cols, row)) for row in (stmt.get("rows") or [])]
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return list(self._rows)
+
+    def __iter__(self):
+        return iter(self._rows)
+
+
+class TursoConn:
+    def __init__(self, db):
+        self._db = db
+
+    def execute(self, sql, args=None):
+        return TursoResult(self._db.statement(sql, args or ()))
+
+    def executemany(self, sql, seq):
+        self._db.statements([(sql, a) for a in seq])
+        return None
+
+    def cursor(self):
+        return self
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def get_conn():
+    if TURSO_ENABLED:
+        return TursoConn(turso_db)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+turso_db = TursoDB(TURSO_URL, TURSO_TOKEN) if TURSO_ENABLED else None
 
 
 def now():
@@ -95,17 +182,15 @@ def make_pin():
     return str(secrets.randbelow(900000) + 100000)
 
 
-def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
-
-
 def init_db():
     conn = get_conn()
-    conn.executescript(SCHEMA)
-    conn.execute("PRAGMA journal_mode=WAL")
+    if TURSO_ENABLED:
+        for stmt in SCHEMA_STATEMENTS:
+            conn.execute(stmt)
+    else:
+        conn.execute("PRAGMA journal_mode=WAL")
+        for stmt in SCHEMA_STATEMENTS:
+            conn.execute(stmt)
     count = conn.execute("SELECT COUNT(*) AS c FROM elections").fetchone()["c"]
     if count == 0:
         seed(conn)
@@ -119,9 +204,7 @@ def heal_demo_election():
     rows = conn.execute("SELECT id, title, status FROM elections").fetchall()
     if len(rows) == 1 and rows[0]["title"] == "General Secretary & College President Election 2026":
         eid = rows[0]["id"]
-        ballots = conn.execute(
-            "SELECT COUNT(*) AS c FROM ballots WHERE election_id=?", (eid,)
-        ).fetchone()["c"]
+        ballots = conn.execute("SELECT COUNT(*) AS c FROM ballots WHERE election_id=?", (eid,)).fetchone()["c"]
         if ballots == 0 and rows[0]["status"] != "open":
             conn.execute("DELETE FROM voter_status WHERE election_id=?", (eid,))
             conn.execute("UPDATE elections SET status='open' WHERE id=?", (eid,))
@@ -155,24 +238,22 @@ def seed(conn):
         (eid, "General Secretary & College President Election 2026", "college-wide", "open", now()),
     )
     for d in DEPARTMENTS:
-        conn.execute(
-            "INSERT INTO election_departments (election_id, department) VALUES (?, ?)", (eid, d)
-        )
+        conn.execute("INSERT INTO election_departments (election_id, department) VALUES (?, ?)", (eid, d))
 
     positions = [
         ("General Secretary", "Manages council coordination, communications and documentation across all departments.", [
-            ("Suraj Jadhav", "AI & ML", "SE", "Digital documentation, transparent records, student newsletter", "⚙️"),
-            ("Sneha Kulkarni", "Electronics & Telecommunication", "BE", "Streamlined communication, event coordination, council accountability", "🛰️"),
-            ("Aditya Patil", "Civil Engineering", "SE", "Organized record systems, health & safety bulletins, campus outreach", "🏗️"),
+            ("Suraj Jadhav", "AI & ML", "SE", "Digital documentation, transparent records, student newsletter", "\u2699\ufe0f"),
+            ("Sneha Kulkarni", "Electronics & Telecommunication", "BE", "Streamlined communication, event coordination, council accountability", "\U0001f6f0\ufe0f"),
+            ("Aditya Patil", "Civil Engineering", "SE", "Organized record systems, health & safety bulletins, campus outreach", "\U0001f3d7\ufe0f"),
         ]),
         ("College President", "Represents all engineering students and heads the student council.", [
-            ("Priya Sharma", "Computer Engineering", "TE", "Tech literacy programs, career placement, campus innovation hub", "💻"),
-            ("Rohan Verma", "Computer Engineering", "SE", "Scholarship expansion, student welfare, inclusive governance", "🎯"),
-            ("Kavya Nair", "Electronics & Telecommunication", "TE", "Mental health programs, campus-wide Wi-Fi, sustainability drive", "🌐"),
+            ("Priya Sharma", "Computer Engineering", "TE", "Tech literacy programs, career placement, campus innovation hub", "\U0001f4bb"),
+            ("Rohan Verma", "Computer Engineering", "SE", "Scholarship expansion, student welfare, inclusive governance", "\U0001f3af"),
+            ("Kavya Nair", "Electronics & Telecommunication", "TE", "Mental health programs, campus-wide Wi-Fi, sustainability drive", "\U0001f310"),
         ]),
         ("Sports & Cultural Coordinator", "Organizes inter-department sports, cultural festivals and student events.", [
-            ("Varun Deshmukh", "Civil Engineering", "BE", "Annual sports meet, inter-department tournaments, fitness initiatives", "🏆"),
-            ("Aditya Pawar", "AI & ML", "SE", "Cultural fest, arts funding, student creative spaces", "🎭"),
+            ("Varun Deshmukh", "Civil Engineering", "BE", "Annual sports meet, inter-department tournaments, fitness initiatives", "\U0001f3c6"),
+            ("Aditya Pawar", "AI & ML", "SE", "Cultural fest, arts funding, student creative spaces", "\U0001f3ad"),
         ]),
     ]
     for title, desc, cands in positions:
@@ -204,21 +285,16 @@ def compute_results(election_id):
     if not election:
         conn.close()
         return None
-    positions = conn.execute(
-        "SELECT * FROM positions WHERE election_id=? ORDER BY rowid", (election_id,)
-    ).fetchall()
+    positions = conn.execute("SELECT * FROM positions WHERE election_id=? ORDER BY rowid", (election_id,)).fetchall()
     total_students = conn.execute("SELECT COUNT(*) AS c FROM students").fetchone()["c"]
     eligible = total_students
     if election["type"] != "college-wide":
         depts = [
             r["department"]
-            for r in conn.execute(
-                "SELECT department FROM election_departments WHERE election_id=?", (election_id,)
-            )
+            for r in conn.execute("SELECT department FROM election_departments WHERE election_id=?", (election_id,))
         ]
         eligible = conn.execute(
-            "SELECT COUNT(*) AS c FROM students WHERE department IN (%s)"
-            % ",".join("?" * len(depts)),
+            "SELECT COUNT(*) AS c FROM students WHERE department IN (%s)" % ",".join("?" * len(depts)),
             depts,
         ).fetchone()["c"]
     votes = conn.execute(
@@ -228,9 +304,7 @@ def compute_results(election_id):
 
     out_positions = []
     for p in positions:
-        cand_rows = conn.execute(
-            "SELECT * FROM candidates WHERE position_id=? ORDER BY rowid", (p["id"],)
-        ).fetchall()
+        cand_rows = conn.execute("SELECT * FROM candidates WHERE position_id=? ORDER BY rowid", (p["id"],)).fetchall()
         tally = {}
         for c in cand_rows:
             tally[c["id"]] = conn.execute(
@@ -296,14 +370,10 @@ def build_election_detail(conn, election):
         )
     ]
     positions = []
-    for p in conn.execute(
-        "SELECT * FROM positions WHERE election_id=? ORDER BY rowid", (election["id"],)
-    ):
+    for p in conn.execute("SELECT * FROM positions WHERE election_id=? ORDER BY rowid", (election["id"],)):
         candidates = [
             dict(c)
-            for c in conn.execute(
-                "SELECT * FROM candidates WHERE position_id=? ORDER BY rowid", (p["id"],)
-            )
+            for c in conn.execute("SELECT * FROM candidates WHERE position_id=? ORDER BY rowid", (p["id"],))
         ]
         positions.append({
             "id": p["id"],
@@ -366,25 +436,17 @@ def replace_election_payload(conn, election_id, data):
     cur = conn.cursor()
     cur.execute("DELETE FROM election_departments WHERE election_id=?", (election_id,))
     for d in data.get("departments", []):
-        cur.execute(
-            "INSERT INTO election_departments (election_id, department) VALUES (?, ?)",
-            (election_id, d),
-        )
+        cur.execute("INSERT INTO election_departments (election_id, department) VALUES (?, ?)", (election_id, d))
     existing_pos_ids = {
         r["id"]
-        for r in cur.execute(
-            "SELECT id FROM positions WHERE election_id=?", (election_id,)
-        ).fetchall()
+        for r in cur.execute("SELECT id FROM positions WHERE election_id=?", (election_id,)).fetchall()
     }
     new_pos_ids = set()
     for p in data.get("positions", []):
         pid = p.get("id")
         is_existing_pos = pid and pid in existing_pos_ids
         if is_existing_pos:
-            cur.execute(
-                "UPDATE positions SET title=?, description=? WHERE id=?",
-                (p["title"], p.get("description", ""), pid),
-            )
+            cur.execute("UPDATE positions SET title=?, description=? WHERE id=?", (p["title"], p.get("description", ""), pid))
         else:
             pid = make_id("p_")
             cur.execute(
@@ -394,9 +456,7 @@ def replace_election_payload(conn, election_id, data):
         new_pos_ids.add(pid)
         existing_cand_ids = {
             r["id"]
-            for r in cur.execute(
-                "SELECT id FROM candidates WHERE position_id=?", (pid,)
-            ).fetchall()
+            for r in cur.execute("SELECT id FROM candidates WHERE position_id=?", (pid,)).fetchall()
         }
         new_cand_ids = set()
         for c in p.get("candidates", []):
@@ -589,28 +649,21 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True, **detail})
                 return
             if parts[2] == "students" and len(parts) == 3:
-                rows = [
-                    dict(r)
-                    for r in conn.execute("SELECT * FROM students ORDER BY id").fetchall()
-                ]
+                rows = [dict(r) for r in conn.execute("SELECT * FROM students ORDER BY id").fetchall()]
                 conn.close()
                 self._json(200, {"ok": True, "students": rows})
                 return
             if parts[2] == "audit" and len(parts) == 3:
-                rows = [
-                    dict(r)
-                    for r in conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 300").fetchall()
-                ]
+                rows = [dict(r) for r in conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 300").fetchall()]
                 conn.close()
                 self._json(200, {"ok": True, "log": rows})
                 return
             if parts[2] == "export" and len(parts) == 4:
                 res = compute_results(parts[3])
+                conn.close()
                 if not res:
-                    conn.close()
                     self._json(404, {"ok": False, "error": "Election not found"})
                     return
-                conn.close()
                 csv = "Position,Candidate,Votes,Percentage\n"
                 for pos in res["positions"]:
                     for row in pos["rows"]:
@@ -664,75 +717,59 @@ class Handler(BaseHTTPRequestHandler):
             election_id = str(data.get("election_id", ""))
             selections = data.get("selections") or {}
             with write_lock:
-                conn = sqlite3.connect(DB_PATH)
-                conn.row_factory = sqlite3.Row
-                conn.execute("PRAGMA foreign_keys = ON")
-                conn.isolation_level = None
+                conn = get_conn()
                 try:
-                    conn.execute("BEGIN IMMEDIATE")
-                    cur = conn.cursor()
-                    election = cur.execute("SELECT * FROM elections WHERE id=?", (election_id,)).fetchone()
+                    election = conn.execute("SELECT * FROM elections WHERE id=?", (election_id,)).fetchone()
                     if not election:
-                        conn.execute("ROLLBACK")
                         self._json(404, {"ok": False, "error": "Election not found"})
                         return
                     if election["status"] != "open":
-                        conn.execute("ROLLBACK")
                         self._json(409, {"ok": False, "error": "Voting is not open"})
                         return
-                    student = cur.execute("SELECT * FROM students WHERE id=?", (info["student_id"],)).fetchone()
+                    student = conn.execute("SELECT * FROM students WHERE id=?", (info["student_id"],)).fetchone()
                     if not student:
-                        conn.execute("ROLLBACK")
                         self._json(401, {"ok": False, "error": "Student not found"})
                         return
                     if election["type"] != "college-wide":
-                        okd = cur.execute(
+                        okd = conn.execute(
                             "SELECT 1 FROM election_departments WHERE election_id=? AND department=?",
                             (election_id, student["department"]),
                         ).fetchone()
                         if not okd:
-                            conn.execute("ROLLBACK")
                             self._json(403, {"ok": False, "error": "You are not eligible for this election"})
                             return
-                    positions = cur.execute(
-                        "SELECT id FROM positions WHERE election_id=?", (election_id,)
-                    ).fetchall()
+                    positions = conn.execute("SELECT id FROM positions WHERE election_id=?", (election_id,)).fetchall()
                     pos_ids = {r["id"] for r in positions}
                     if set(selections.keys()) != pos_ids:
-                        conn.execute("ROLLBACK")
                         self._json(400, {"ok": False, "error": "Every position must have exactly one selection"})
                         return
                     for pid, cid in selections.items():
                         if cid != "NOTA":
-                            okc = cur.execute(
+                            okc = conn.execute(
                                 "SELECT 1 FROM candidates WHERE id=? AND position_id=?", (cid, pid)
                             ).fetchone()
                             if not okc:
-                                conn.execute("ROLLBACK")
                                 self._json(400, {"ok": False, "error": "Invalid candidate selection"})
                                 return
                     receipt = "SAE-" + secrets.token_hex(4).upper()
                     ts = now()
                     try:
-                        cur.execute(
+                        conn.execute(
                             "INSERT INTO voter_status (election_id, student_id, receipt_no, voted_at) VALUES (?, ?, ?, ?)",
                             (election_id, info["student_id"], receipt, ts),
                         )
-                    except sqlite3.IntegrityError:
-                        conn.execute("ROLLBACK")
+                    except (RowConflictError, sqlite3.IntegrityError):
                         self._json(409, {"ok": False, "error": "This student has already voted in this election"})
                         return
                     ballot_id = "b" + secrets.token_hex(5)
-                    for pid, cid in selections.items():
-                        cur.execute(
-                            "INSERT INTO ballots (ballot_id, election_id, position_id, candidate_id, voted_at) VALUES (?, ?, ?, ?, ?)",
-                            (ballot_id, election_id, pid, cid, ts),
-                        )
-                    conn.execute("COMMIT")
+                    conn.executemany(
+                        "INSERT INTO ballots (ballot_id, election_id, position_id, candidate_id, voted_at) VALUES (?, ?, ?, ?, ?)",
+                        [(ballot_id, election_id, pid, cid, ts) for pid, cid in selections.items()],
+                    )
                     self._json(200, {"ok": True, "receipt": receipt})
                 except Exception as ex:
                     try:
-                        conn.execute("ROLLBACK")
+                        conn.rollback()
                     except Exception:
                         pass
                     self._json(500, {"ok": False, "error": "Server error: " + str(ex)})
@@ -843,16 +880,15 @@ class Handler(BaseHTTPRequestHandler):
             with write_lock:
                 conn = get_conn()
                 try:
-                    cur = conn.cursor()
                     inserted = 0
                     for r in staged["records"]:
                         try:
-                            cur.execute(
+                            conn.execute(
                                 "INSERT INTO students (id, name, department, year, pin) VALUES (?, ?, ?, ?, ?)",
                                 (r["id"], r["name"], r["department"], r["year"], r["pin"]),
                             )
                             inserted += 1
-                        except sqlite3.IntegrityError:
+                        except (RowConflictError, sqlite3.IntegrityError):
                             pass
                     audit(conn, f"Imported {inserted} students")
                     conn.commit()
@@ -994,6 +1030,13 @@ class Handler(BaseHTTPRequestHandler):
                     conn.execute("DELETE FROM students WHERE id=?", (sid,))
                     audit(conn, f'Removed student "{sid}"')
                     conn.commit()
+                except Exception as ex:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    self._json(500, {"ok": False, "error": str(ex)})
+                    return
                 finally:
                     conn.close()
             self._json(200, {"ok": True})
@@ -1008,6 +1051,13 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     conn.execute("DELETE FROM audit_log")
                     conn.commit()
+                except Exception as ex:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    self._json(500, {"ok": False, "error": str(ex)})
+                    return
                 finally:
                     conn.close()
             self._json(200, {"ok": True})
@@ -1020,6 +1070,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if TURSO_ENABLED:
+        print("  Database : Turso (%s)" % turso_db.endpoint)
+    else:
+        missing = []
+        if not TURSO_URL:
+            missing.append("turso_url.txt")
+        if not TURSO_TOKEN:
+            missing.append("turso_token.txt")
+        print("  Database : %s (LOCAL SQLite - Turso NOT configured; add %s)" % (DB_PATH, ", ".join(missing)))
     init_db()
     heal_demo_election()
 
@@ -1034,7 +1093,6 @@ if __name__ == "__main__":
         raise SystemExit(0)
     print("=" * 56)
     print("  Student Association Election System")
-    print(f"  Database : {DB_PATH}")
     print(f"  URL      : http://{HOST}:{PORT}")
     print("  Admin    : admin / admin123")
     print("  Demo voters (ID / PIN):")
